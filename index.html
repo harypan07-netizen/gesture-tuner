@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gesture Tuner</title>
+<style>
+:root{--bg:#14171c;--fg:#e8eaed;--mut:#8f96a3;--ac:#7dd3fc;--card:#1d2128}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;padding:8px}
+#stage{position:relative;max-width:480px;margin:0 auto;background:#000;border-radius:10px;overflow:hidden;min-height:120px}
+video{width:100%;display:block;transform:scaleX(-1)}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+#ban{position:absolute;left:0;right:0;top:8px;text-align:center;font:700 28px system-ui;color:var(--ac);text-shadow:0 2px 6px #000}
+.card{max-width:480px;margin:8px auto;background:var(--card);border-radius:10px;padding:10px}
+button{background:var(--ac);color:#000;border:0;border-radius:8px;padding:10px 14px;font-weight:600;margin:2px}
+pre{margin:0;font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap}
+label{display:flex;align-items:center;gap:6px;font-size:12px;margin:4px 0}
+label span{width:92px;color:var(--mut)}label input{flex:1}label b{width:44px;text-align:right}
+</style></head><body>
+<div id="stage"><video id="v" playsinline muted></video><canvas id="c"></canvas><div id="ban"></div></div>
+<div class="card"><button id="go">Start camera</button><button id="cp">Copy config</button><button id="rs">Reset values</button><button id="cpt">Copy last 8s trace</button></div>
+<div class="card"><pre id="ro">Tap Start camera and allow access.</pre></div>
+<div class="card"><pre id="lg">Events appear here.</pre><textarea id="tx" rows="4" style="display:none;width:100%;margin-top:6px"></textarea></div>
+<details class="card"><summary>Thresholds</summary><div id="sl"></div></details>
+<script type="module">
+import {HandLandmarker,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const DEF={preHold:250,riseMs:650,pointGuard:800,pinchIn:.25,pinchOut:.4,extOpen:1.6,curl:1.1,deb:3,thumbTuck:.5,thumbFlare:.8,swipeDist:.8,swipeMs:250,openMean:1.6,rise:.5,closeMean:1.45,ext3:1.35,lockMs:1500,flickCool:900,holdMs:2000,pinchLoose:1.7,pinchHold:250,prevSame:1,restSpeed:.6,armMs:300,cooldown:500,volDead:.05,volStep:.15,lookback:120,gain:2.5,minCut:1,beta:1.5};
+const RNG={preHold:[0,800,25],riseMs:[150,1000,25],pointGuard:[0,2000,100],pinchIn:[.1,.5,.01],pinchOut:[.2,.8,.01],extOpen:[1.2,2.2,.05],curl:[.8,1.5,.05],deb:[1,6,1],thumbTuck:[.2,1,.05],thumbFlare:[.4,1.4,.05],swipeDist:[.3,2,.05],swipeMs:[100,500,10],openMean:[1.2,2,.05],rise:[.1,1,.05],closeMean:[1,1.9,.05],ext3:[1.1,1.8,.05],lockMs:[0,3000,100],flickCool:[300,2000,50],holdMs:[1000,4000,100],pinchLoose:[1.3,2.2,.05],pinchHold:[0,600,25],prevSame:[0,1,1],restSpeed:[.1,2,.05],armMs:[0,800,50],cooldown:[200,1000,50],volDead:[0,.2,.01],volStep:[.05,.4,.01],lookback:[0,300,10],gain:[1,6,.1],minCut:[.2,4,.1],beta:[0,5,.1]};
+let cfg={...DEF};
+try{Object.assign(cfg,JSON.parse(localStorage.getItem("gt")||"{}"))}catch(e){}
+const $=id=>document.getElementById(id);
+const v=$("v"),c=$("c"),ctx=c.getContext("2d");
+const save=()=>{try{localStorage.setItem("gt",JSON.stringify(cfg))}catch(e){}};
+function sliders(){$("sl").innerHTML="";for(const k in RNG){const[lo,hi,st]=RNG[k];const l=document.createElement("label");
+l.innerHTML=`<span>${k}</span><input type="range" min="${lo}" max="${hi}" step="${st}" value="${cfg[k]}"><b>${cfg[k]}</b>`;
+const i=l.querySelector("input"),b=l.querySelector("b");i.oninput=()=>{cfg[k]=+i.value;b.textContent=cfg[k];save()};$("sl").append(l)}}
+sliders();
+$("cpt").onclick=()=>{const txt="t,raw,pose,mean,S,x,y,idxExt,idx3d,thumb,pinch\n"+TR.map(r=>r.s).join("\n");const tx=$("tx");tx.style.display="block";tx.value=txt;tx.select();try{navigator.clipboard.writeText(txt).then(()=>flash("Trace copied"),()=>flash("Select and copy the text"))}catch(e){flash("Select and copy the text")}};
+$("rs").onclick=()=>{cfg={...DEF};save();sliders()};
+$("cp").onclick=()=>{navigator.clipboard&&navigator.clipboard.writeText(JSON.stringify(cfg,null,1)).then(()=>flash("Copied"),()=>flash("Copy blocked"))};
+
+class OE{constructor(){this.x=null}
+f(val,t){if(this.x===null){this.x=val;this.dx=0;this.t=t;return val}
+const dt=Math.max((t-this.t)/1000,.001),a=cu=>1/(1+1/(2*Math.PI*cu*dt));
+this.dx+=a(1)*((val-this.x)/dt-this.dx);
+this.x+=a(cfg.minCut+cfg.beta*Math.abs(this.dx))*(val-this.x);this.t=t;return this.x}}
+
+const logs=[];let banT=0;const TR=[];function pushTR(t,s){TR.push({t,s});while(TR[0].t<t-8000)TR.shift()}
+function flash(s){$("ban").textContent=s;clearTimeout(banT);banT=setTimeout(()=>$("ban").textContent="",800)}
+function ev(t,s){pushTR(t,"EVENT "+Math.round(t)+" "+s);logs.unshift((t/1000).toFixed(1)+"s  "+s);logs.length=Math.min(logs.length,8);$("lg").textContent=logs.join("\n");flash(s)}
+
+let ST;
+function reset(){ST={pose:"NONE",cand:"NONE",n:0,solid:"NONE",lastOpenT:0,pinchOn:false,thumbOut:false,buf:[],cur:[],grp:"",
+ox:new OE(),oy:new OE(),armed:false,still:null,holdT:null,holdFired:false,raw:[],flCool:0,lockPrev:0,lockNext:0,pointT:-9999,cStart:0,cEnd:-9999,oStart:0,oEnd:-9999,cool:0,y0:0,vol:false,cx:.5,cy:.5,px:null,py:null,miss:0,click:null,fx:0,fy:0,S:1,tOut:0}}
+reset();
+
+function onPose(pose,t){
+const prev=ST.solid;
+if(pose==="OTHER")return;
+ST.solid=pose;
+if(pose==="OPEN"){ST.lastOpenT=t;ST.armed=false;ST.still=null;ST.holdT=null}
+if(pose==="PINCH"){ST.y0=ST.fy;ST.vol=false;ST.pinchT=t}
+if(pose==="POINT"){ST.thumbOut=ST.tOut>cfg.thumbTuck;ST.px=null}
+}
+
+function frame(res,t,vw,vh){
+if(!res.landmarks||!res.landmarks.length){
+if(++ST.miss>=12&&ST.pose!=="NONE"){const k=ST.click;reset();ev(t,"TRACKING LOST");ST.click=k}
+pushTR(t,Math.round(t)+",none");
+return null}
+ST.miss=0;
+const lm=res.landmarks[0],A=vw/vh,P=lm.map(p=>({x:p.x*A,y:p.y,z:(p.z||0)*A}));
+const d=(a,b)=>Math.hypot(P[a].x-P[b].x,P[a].y-P[b].y);
+const S=d(0,9)||.001;
+const e=[[8,5],[12,9],[16,13],[20,17]].map(([a,b])=>d(a,0)/d(b,0));
+const pinch=d(4,8)/S,tOut=d(4,5)/S;
+const d3=(a,b)=>Math.hypot(P[a].x-P[b].x,P[a].y-P[b].y,P[a].z-P[b].z),e3=d3(8,0)/(d3(5,0)||.001);
+ST.pinchOn=ST.pinchOn?pinch<cfg.pinchOut:pinch<cfg.pinchIn;
+const nExt=e.filter(x=>x>cfg.extOpen).length;
+let raw="OTHER";
+if(ST.pinchOn&&e[1]>cfg.pinchLoose&&e[2]>cfg.pinchLoose&&e[3]>cfg.pinchLoose)raw="PINCH";
+else if((e[0]>cfg.extOpen||e3>cfg.ext3)&&e[1]<cfg.curl&&e[2]<cfg.curl&&e[3]<cfg.curl)raw="POINT";
+else if(nExt>=4&&pinch>.5)raw="OPEN";
+else if(e.every(x=>x<cfg.curl))raw="FIST";
+const grp=raw==="PINCH"?"p":raw==="POINT"?"t":"h";
+const ap=raw==="PINCH"?{x:(P[4].x+P[8].x)/2,y:(P[4].y+P[8].y)/2}:raw==="POINT"?P[8]:
+{x:(P[0].x+P[5].x+P[9].x+P[13].x+P[17].x)/5,y:(P[0].y+P[5].y+P[9].y+P[13].y+P[17].y)/5};
+const fx=ST.ox.f(A-ap.x,t),fy=ST.oy.f(ap.y,t);
+if(grp!==ST.grp){ST.grp=grp;ST.buf=[];ST.px=null}
+ST.buf.push({t,x:fx,y:fy});while(ST.buf[0].t<t-700)ST.buf.shift();
+ST.fx=fx;ST.fy=fy;ST.S=S;ST.tOut=tOut;if(raw==="POINT")ST.pointT=t;
+pushTR(t,[Math.round(t),raw,ST.pose,((e[0]+e[1]+e[2]+e[3])/4).toFixed(2),S.toFixed(3),fx.toFixed(3),fy.toFixed(3),e[0].toFixed(2),e3.toFixed(2),tOut.toFixed(2),pinch.toFixed(2)].join(","));
+if(raw!=="PINCH"&&raw!=="POINT"){
+const rx=A-ap.x,ry=ap.y,mean=(e[0]+e[1]+e[2]+e[3])/4;
+ST.raw.push({t,x:rx,y:ry,m:mean});while(ST.raw[0].t<t-cfg.riseMs)ST.raw.shift();
+if(mean<cfg.closeMean){if(t-ST.cEnd>150)ST.cStart=t;ST.cEnd=t}
+if(mean>cfg.openMean){if(t-ST.oEnd>150)ST.oStart=t;ST.oEnd=t}
+const w=ST.raw.filter(q=>q.t>=t-cfg.riseMs);
+if(t>ST.flCool&&t>ST.pointT+cfg.pointGuard&&w.length>2){
+let lo=w[0],hi=w[0];for(const q of w){if(q.m<lo.m)lo=q;if(q.m>hi.m)hi=q}
+if(mean>cfg.openMean&&lo.m<=cfg.closeMean&&mean-lo.m>=cfg.rise&&ST.cEnd-ST.cStart>=cfg.preHold&&t>ST.lockNext){ev(t,"NEXT");ST.lockPrev=t+cfg.lockMs;ST.flCool=t+cfg.flickCool;ST.holdFired=true;ST.raw=[]}
+else if(mean<cfg.closeMean&&hi.m>=cfg.openMean&&hi.m-mean>=cfg.rise&&ST.oEnd-ST.oStart>=cfg.preHold&&t>ST.lockPrev){ev(t,"PREVIOUS");ST.lockNext=t+cfg.lockMs;ST.flCool=t+cfg.flickCool;ST.raw=[]}}
+}
+if(raw===ST.cand)ST.n++;else{ST.cand=raw;ST.n=1}
+if(ST.n>=cfg.deb&&ST.cand!==ST.pose){ST.pose=ST.cand;onPose(ST.pose,t)}
+const b=ST.buf;let sp=0;
+const s=b.find(q=>q.t>=t-100);
+if(s&&t-s.t>30)sp=Math.hypot(fx-s.x,fy-s.y)/S/((t-s.t)/1000);
+if(ST.pose!=="OPEN"){ST.holdT=null;ST.holdFired=false}
+if(ST.pose==="OPEN"){
+if(sp<cfg.restSpeed){if(ST.holdT===null)ST.holdT=t;if(!ST.holdFired&&t-ST.holdT>=cfg.holdMs){ev(t,"PLAY / PAUSE");ST.holdFired=true}}else ST.holdT=null;
+if(sp<cfg.restSpeed){if(ST.still===null)ST.still=t;if(t-ST.still>=cfg.armMs)ST.armed=true}else ST.still=null;
+}
+if(ST.pose==="PINCH"){
+if(t-ST.pinchT<cfg.pinchHold)ST.y0=fy;else{
+const dy=(fy-ST.y0)/S,thr=ST.vol?cfg.volStep:cfg.volDead+cfg.volStep;
+if(Math.abs(dy)>thr){ev(t,dy<0?"VOLUME UP":"VOLUME DOWN");ST.vol=true;ST.y0=fy}}}
+if(ST.pose==="POINT"){
+if(ST.px!==null){ST.cx=Math.min(1,Math.max(0,ST.cx+(fx-ST.px)/A*cfg.gain));ST.cy=Math.min(1,Math.max(0,ST.cy+(fy-ST.py)*cfg.gain))}
+ST.px=fx;ST.py=fy;
+ST.cur.push({t,cx:ST.cx,cy:ST.cy});while(ST.cur[0].t<t-500)ST.cur.shift();
+const was=ST.thumbOut;ST.thumbOut=was?tOut>cfg.thumbTuck:tOut>cfg.thumbFlare;
+if(ST.thumbOut&&!was){const q=ST.cur.find(z=>z.t>=t-cfg.lookback)||ST.cur[0];ST.click={t,cx:q.cx,cy:q.cy};ev(t,"CLICK")}}
+return {lm,raw,S,pinch,tOut,e,sp,e3,m4:(e[0]+e[1]+e[2]+e[3])/4}}
+
+let hl,last=-1,fc=0,fpsT=performance.now(),fps=0,inf=0,lum=0;
+const bc=document.createElement("canvas");bc.width=16;bc.height=12;
+const bx=bc.getContext("2d",{willReadFrequently:true});
+function draw(r,t){
+const W=c.width,H=c.height;ctx.clearRect(0,0,W,H);
+if(r){ctx.fillStyle="#7dd3fc";for(const p of r.lm){ctx.beginPath();ctx.arc((1-p.x)*W,p.y*H,3,0,7);ctx.fill()}}
+if(ST.pose==="POINT"){ctx.strokeStyle="#7dd3fc";ctx.lineWidth=3;ctx.beginPath();ctx.arc(ST.cx*W,ST.cy*H,16,0,7);ctx.stroke()}
+if(ST.click&&t-ST.click.t<400){ctx.strokeStyle="#fff";ctx.lineWidth=4;ctx.beginPath();ctx.arc(ST.click.cx*W,ST.click.cy*H,16+(t-ST.click.t)/12,0,7);ctx.stroke()}}
+function readout(r){
+const f=x=>x.toFixed(2);
+$("ro").textContent=(r?
+`pose ${ST.pose}  (raw ${r.raw})\nhand size ${f(r.S)}  pinch ${f(r.pinch)}  thumb ${f(r.tOut)}\nfingers idx ${f(r.e[0])} mid ${f(r.e[1])} ring ${f(r.e[2])} pinky ${f(r.e[3])}\nindex3D ${f(r.e3)}  fingerMean ${f(r.m4)}\nspeed ${f(r.sp)}  armed ${ST.armed}  hold ${ST.holdT?((performance.now()-ST.holdT)/1000).toFixed(1):0}s`:
+"no hand")+`\nfps ${fps}  inference ${inf.toFixed(0)} ms  light ${lum.toFixed(0)}${lum<40?" (too dark)":""}`}
+function loop(){
+if(v.currentTime!==last){last=v.currentTime;const t=performance.now();
+const res=hl.detectForVideo(v,t);inf=performance.now()-t;
+if(++fc%15===0){bx.drawImage(v,0,0,16,12);const q=bx.getImageData(0,0,16,12).data;let s=0;for(let i=0;i<q.length;i+=4)s+=.299*q[i]+.587*q[i+1]+.114*q[i+2];lum=s/192}
+if(t-fpsT>1000){fps=fc-(loop.f||0);loop.f=fc;fpsT=t}
+const r=frame(res,t,v.videoWidth,v.videoHeight);draw(r,t);readout(r)}
+requestAnimationFrame(loop)}
+$("go").onclick=async()=>{
+$("go").disabled=true;$("ro").textContent="Loading model...";
+try{
+const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+const mk=dl=>HandLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",delegate:dl},runningMode:"VIDEO",numHands:1});
+try{hl=await mk("GPU")}catch(e){hl=await mk("CPU")}
+v.srcObject=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:640,height:480},audio:false});
+await v.play();c.width=v.videoWidth;c.height=v.videoHeight;reset();loop()
+}catch(err){$("ro").textContent="Error: "+err.message+"\nThis page must be served over HTTPS (for example GitHub Pages).";$("go").disabled=false}};
+</script></body></html>
